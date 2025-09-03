@@ -14,8 +14,7 @@ class ResidualBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim)
-        )
-        
+        )  
     def forward(self, x):
         return x + self.net(x)
 
