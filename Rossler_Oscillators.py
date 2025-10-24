@@ -92,10 +92,12 @@ def get_labels_and_scores(all_edges, true_edges, probs):
         y_score.append(probs[idx])
     return np.array(y_true), np.array(y_score)
 
-def evaluate_edges_triangles(model, all_2edges, true_2edges, all_3edges, true_3edges):
+def evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges):
     with torch.no_grad():
-        edge_probs = torch.sigmoid(model.edge_weights).cpu().numpy()
-        triangle_probs = torch.sigmoid(model.triangle_weights).cpu().numpy()
+        edge_probs, triangle_probs = model.get_sparse_weights(t_data, use_concrete=False, hard=False)
+        # Take the last time step for evaluation
+        edge_probs = edge_probs[-1].cpu().numpy()
+        triangle_probs = triangle_probs[-1].cpu().numpy()
     edge_scores = [abs(edge_probs[idx]) for idx, _ in enumerate(all_2edges)]
     triangle_scores = [abs(triangle_probs[idx]) for idx, _ in enumerate(all_3edges)]
     y_true_2, y_score_2 = get_labels_and_scores(all_2edges, true_2edges, edge_scores)
@@ -117,7 +119,7 @@ for epoch in range(epochs):
     x_pred = model.forward(t_data)
     physics_loss = model.physics_loss(t_data)    
     data_loss = torch.mean((x_pred - x_data)**2)
-    sparsity_loss, sparsity_info = model.sparsity_regularization()        
+    sparsity_loss, sparsity_info = model.sparsity_regularization(t_data)        
     if adaptive_weights and epoch > 500:
         sparsity_weight = max(0.1, 1.0 * (0.99 ** (epoch - 500)))
     else:
@@ -155,12 +157,12 @@ for epoch in range(epochs):
          print(f"  Physics: {physics_loss.item():.6f}, Data: {data_loss.item():.6f}")
          print(f"  Sparsity: {sparsity_loss.item():.6f}")
          print(f"  L1 edges: {sparsity_info['l1_edges']:.2f}, L1 triangles: {sparsity_info['l1_triangles']:.2f}")
-         y_true_2, y_score_2, y_true_3, y_score_3 = evaluate_edges_triangles(model, all_2edges, true_2edges, all_3edges, true_3edges)
+         y_true_2, y_score_2, y_true_3, y_score_3 = evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges)
          auc_2 = compute_auc(y_true_2, y_score_2)
          auc_3 = compute_auc(y_true_3, y_score_3)
          print(f"  AUC (2-edges): {auc_2:.4f}, AUC (3-edges): {auc_3:.4f}")
 
-y_true_2, y_score_2, y_true_3, y_score_3 = evaluate_edges_triangles(model, all_2edges, true_2edges, all_3edges, true_3edges)
+y_true_2, y_score_2, y_true_3, y_score_3 = evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges)
 y_true_total = np.concatenate([y_true_2, y_true_3])
 y_score_total = np.concatenate([y_score_2, y_score_3])   
 plt.figure(figsize=(8, 6))
@@ -174,4 +176,4 @@ plt.title('ROC Curves for Identified Hypergraphs',fontsize=17)
 plt.legend(fontsize=14, loc="lower right")
 plt.xticks(fontsize=12)
 plt.yticks(fontsize=12)
-plt.show()   
+plt.savefig('roc_curves.png', bbox_inches='tight')
