@@ -50,8 +50,15 @@ class HyperPINNTopology(nn.Module):
         num_edges = N * (N-1)//2
         num_triangles = N * (N-1) * (N-2) // 6
         
-        self.edge_weights = nn.Parameter(torch.randn(num_edges) * 0.1 - 2.0)  
-        self.triangle_weights = nn.Parameter(torch.randn(num_triangles) * 0.1 - 3.0)       
+        # Dynamic hypergraph network: input t, output edge and triangle weights
+        self.dynamic_hypergraph = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_edges + num_triangles)
+        )
+        
         self.lambda_l1_edges = 0.01      
         self.lambda_l1_triangles = 0.01 
         self.lambda_l0_edges = 0.001     
@@ -90,21 +97,31 @@ class HyperPINNTopology(nn.Module):
             y = y_soft     
         return y
     
-    def get_sparse_weights(self, use_concrete=True, hard=False):
+    def get_sparse_weights(self, t, use_concrete=True, hard=False):
+        raw_weights = self.dynamic_hypergraph(t)
+        num_edges = len(self.edge_indices)
+        edge_logits = raw_weights[:, :num_edges]
+        triangle_logits = raw_weights[:, num_edges:]
+        
         if use_concrete:
-            edge_probs = self.concrete_binary_gates(self.edge_weights, self.temperature, hard)
-            triangle_probs = self.concrete_binary_gates(self.triangle_weights, self.temperature, hard)
+            edge_probs = self.concrete_binary_gates(edge_logits, self.temperature, hard)
+            triangle_probs = self.concrete_binary_gates(triangle_logits, self.temperature, hard)
         else:
-            edge_probs = torch.sigmoid(self.edge_weights)
-            triangle_probs = torch.sigmoid(self.triangle_weights)
+            edge_probs = torch.sigmoid(edge_logits)
+            triangle_probs = torch.sigmoid(triangle_logits)
             if hard:
                 edge_probs = (edge_probs > 0.5).float()
                 triangle_probs = (triangle_probs > 0.5).float()  
         return edge_probs, triangle_probs
     
-    def sparsity_regularization(self):
-        edge_probs = torch.sigmoid(self.edge_weights)
-        triangle_probs = torch.sigmoid(self.triangle_weights)
+    def sparsity_regularization(self, t):
+        raw_weights = self.dynamic_hypergraph(t)
+        num_edges = len(self.edge_indices)
+        edge_logits = raw_weights[:, :num_edges]
+        triangle_logits = raw_weights[:, num_edges:]
+        
+        edge_probs = torch.sigmoid(edge_logits)
+        triangle_probs = torch.sigmoid(triangle_logits)
 
         l1_edges = torch.sum(edge_probs)
         l1_triangles = torch.sum(triangle_probs)
@@ -130,15 +147,21 @@ class HyperPINNTopology(nn.Module):
         k,kD = 0.4,0.3
         coup_rete = torch.zeros_like(xold)
         coup_triangular = torch.zeros_like(xold)
-        adj_matrix = torch.sigmoid(self.edge_weights)
-        triangle_weights_sigmoid = torch.sigmoid(self.triangle_weights)
+        
+        raw_weights = self.dynamic_hypergraph(t)
+        num_edges = len(self.edge_indices)
+        edge_weights = raw_weights[:, :num_edges]
+        triangle_weights = raw_weights[:, num_edges:]
+        
+        adj_matrix = torch.sigmoid(edge_weights)
+        triangle_weights_sigmoid = torch.sigmoid(triangle_weights)
         
         for idx, (i, j) in enumerate(self.edge_indices):
-            weight =  adj_matrix[idx]
+            weight = adj_matrix[:, idx]
             coup_rete[:, i] += weight * (xold[:, j] - xold[:, i])
             coup_rete[:, j] += weight * (xold[:, i] - xold[:, j])
         for idx, (i, j, k) in enumerate(self.triangle_indices):
-            weight = triangle_weights_sigmoid[idx]
+            weight = triangle_weights_sigmoid[:, idx]
             term_i = weight * (xold[:, j]**2 * xold[:, k] - xold[:, i]**3 + 
                              xold[:, j] * xold[:, k]**2 - xold[:, i]**3)
             term_j = weight * (xold[:, i]**2 * xold[:, k] - xold[:, j]**3 + 
