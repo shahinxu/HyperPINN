@@ -153,7 +153,7 @@ class HyperPINNTopology(nn.Module):
         
         # Split weights by order
         start_idx = 0
-        sparsity_loss = 0.0
+        sparsity_terms = []
         sparsity_info = {}
         
         for order in range(2, self.max_order + 1):
@@ -165,12 +165,16 @@ class HyperPINNTopology(nn.Module):
             l1_term = torch.sum(probs)
             l0_term = torch.sum(probs * (1 - probs) * 4)
             
-            sparsity_loss += self.lambda_l1[order] * l1_term + self.lambda_l0[order] * l0_term
+            order_sparsity = self.lambda_l1[order] * l1_term + self.lambda_l0[order] * l0_term
+            sparsity_terms.append(order_sparsity)
             
             sparsity_info[f'l1_order_{order}'] = l1_term.item()
             sparsity_info[f'l0_order_{order}'] = l0_term.item()
             
             start_idx = end_idx
+        
+        # Sum all sparsity terms (avoiding inplace operations)
+        sparsity_loss = torch.sum(torch.stack(sparsity_terms)) if sparsity_terms else torch.tensor(0.0)
         
         # For backward compatibility
         sparsity_info['l1_edges'] = sparsity_info.get('l1_order_2', 0.0)
@@ -181,6 +185,16 @@ class HyperPINNTopology(nn.Module):
         return sparsity_loss, sparsity_info
      
     def physics_loss(self, t):
+        """
+        计算物理损失函数
+        
+        注意: 这里使用 torch.autograd.grad 计算神经网络输出对时间的梯度 (∂x_pred/∂t)，
+        这与 Rossler_Oscillators.py 中的 roessler_hoi_extended 函数不同：
+        - HyperPINNTopology: 自动微分 ∂x_pred/∂t (神经网络方法)  
+        - roessler_hoi_extended: 解析微分方程 dx/dt = f(x,t) (数值积分方法)
+        
+        两种方法的物理方程实现必须完全一致，但微分计算方式不同是正常的。
+        """
         x_pred = self.forward(t)
         dx_dt_pred = torch.zeros_like(x_pred)
         for i in range(x_pred.shape[1]):
@@ -193,8 +207,10 @@ class HyperPINNTopology(nn.Module):
         ar, br, cr = 0.2, 0.2, 5.7
         k, kD = 0.4, 0.3
         
-        # Initialize coupling terms for higher orders
-        coup_total = torch.zeros_like(xold)
+        # Initialize coupling contributions for each node (avoid inplace operations)
+        coupling_contributions = []
+        for node in range(xold.shape[1]):
+            coupling_contributions.append([])
         
         raw_weights = self.dynamic_hypergraph(t)
         start_idx = 0
@@ -212,48 +228,59 @@ class HyperPINNTopology(nn.Module):
                 # Pairwise interactions (edges)
                 for idx, (i, j) in enumerate(self.simplex_indices[2]):
                     weight = weights[:, idx]
-                    coup_total[:, i] += coupling_strength * weight * (xold[:, j] - xold[:, i])
-                    coup_total[:, j] += coupling_strength * weight * (xold[:, i] - xold[:, j])
+                    term_i = coupling_strength * weight * (xold[:, j] - xold[:, i])
+                    term_j = coupling_strength * weight * (xold[:, i] - xold[:, j])
+                    coupling_contributions[i].append(term_i)
+                    coupling_contributions[j].append(term_j)
             
             elif order == 3:
-                # Third-order interactions (triangles)
+                # Third-order interactions (triangles) - 与 Rossler_Oscillators.py 保持一致
                 for idx, (i, j, k) in enumerate(self.simplex_indices[3]):
                     weight = weights[:, idx]
-                    term_i = weight * (xold[:, j]**2 * xold[:, k] - xold[:, i]**3 + 
-                                     xold[:, j] * xold[:, k]**2 - xold[:, i]**3)
-                    term_j = weight * (xold[:, i]**2 * xold[:, k] - xold[:, j]**3 + 
-                                     xold[:, i] * xold[:, k]**2 - xold[:, j]**3)
-                    term_k = weight * (xold[:, i]**2 * xold[:, j] - xold[:, k]**3 + 
-                                     xold[:, i] * xold[:, j]**2 - xold[:, k]**3)   
-                    coup_total[:, i] += coupling_strength * term_i
-                    coup_total[:, j] += coupling_strength * term_j
-                    coup_total[:, k] += coupling_strength * term_k
+                    # 确保与 roessler_hoi_extended 中的公式完全一致
+                    term_i = coupling_strength * weight * (xold[:, j]**2 * xold[:, k] - xold[:, i]**3 + 
+                                                         xold[:, j] * xold[:, k]**2 - xold[:, i]**3)
+                    term_j = coupling_strength * weight * (xold[:, i]**2 * xold[:, k] - xold[:, j]**3 + 
+                                                         xold[:, i] * xold[:, k]**2 - xold[:, j]**3)
+                    term_k = coupling_strength * weight * (xold[:, i]**2 * xold[:, j] - xold[:, k]**3 + 
+                                                         xold[:, i] * xold[:, j]**2 - xold[:, k]**3)   
+                    coupling_contributions[i].append(term_i)
+                    coupling_contributions[j].append(term_j)
+                    coupling_contributions[k].append(term_k)
             
             elif order == 4:
-                # Fourth-order interactions (tetrahedra)
+                # Fourth-order interactions (tetrahedra) - 与 Rossler_Oscillators.py 保持一致
                 for idx, (i, j, k, l) in enumerate(self.simplex_indices[4]):
                     weight = weights[:, idx]
-                    # Generalized higher-order interaction
-                    for node in [i, j, k, l]:
-                        other_nodes = [n for n in [i, j, k, l] if n != node]
-                        interaction_term = weight * (xold[:, other_nodes[0]] * xold[:, other_nodes[1]] * xold[:, other_nodes[2]] - xold[:, node]**3)
-                        coup_total[:, node] += coupling_strength * interaction_term
+                    # 与 roessler_hoi_extended 中的实现完全一致
+                    for node_pos, node in enumerate([i, j, k, l]):
+                        other_nodes = [n for pos, n in enumerate([i, j, k, l]) if pos != node_pos]
+                        interaction_term = coupling_strength * weight * (xold[:, other_nodes[0]] * xold[:, other_nodes[1]] * 
+                                                                      xold[:, other_nodes[2]] - xold[:, node]**3)
+                        coupling_contributions[node].append(interaction_term)
             
             else:
-                # Higher-order interactions (order >= 5)
+                # Higher-order interactions (order >= 5) - 与 Rossler_Oscillators.py 保持一致
                 for idx, simplex in enumerate(self.simplex_indices[order]):
                     weight = weights[:, idx]
-                    # Generalized higher-order interaction
-                    for node in simplex:
-                        other_nodes = [n for n in simplex if n != node]
-                        # Product of all other nodes minus self-interaction
+                    # 与 roessler_hoi_extended 中的实现完全一致
+                    for node_pos, node in enumerate(simplex):
+                        other_nodes = [n for pos, n in enumerate(simplex) if pos != node_pos]
+                        # 所有其他节点的乘积减去自交互
                         interaction_term = weight
                         for other_node in other_nodes:
-                            interaction_term *= xold[:, other_node]
-                        interaction_term -= weight * xold[:, node]**(order-1)
-                        coup_total[:, node] += coupling_strength * interaction_term
+                            interaction_term = interaction_term * xold[:, other_node]
+                        interaction_term = interaction_term - weight * xold[:, node]**(order-1)
+                        final_term = coupling_strength * interaction_term
+                        coupling_contributions[node].append(final_term)
             
             start_idx = end_idx
+        
+        # Sum all contributions for each node (avoiding inplace operations)
+        coup_total = torch.zeros_like(xold)
+        for node in range(xold.shape[1]):
+            if coupling_contributions[node]:
+                coup_total[:, node] = torch.sum(torch.stack(coupling_contributions[node]), dim=0)
         
         term1 = -yold - zold + coup_total
         term2 = xold + ar * yold
