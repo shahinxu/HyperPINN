@@ -31,9 +31,9 @@ class HyperPINNTopology(nn.Module):
             self.attention = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
             self.norm1 = nn.LayerNorm(hidden_dim)
             self.ff = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim)
+                nn.Linear(hidden_dim, hidden_dim)
             )
             self.norm2 = nn.LayerNorm(hidden_dim)
             self.output_proj = nn.Linear(hidden_dim, output_dim)
