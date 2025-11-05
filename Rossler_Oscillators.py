@@ -98,10 +98,25 @@ nt = len(t_eval)
 dxdt = np.array([roessler_hoi(t, sol.y[:, i], EdgeList, TriangleList, QuadList, QuintList) for i, t in enumerate(sol.t)])
 
 x_data = torch.tensor(X, dtype=torch.float64) 
+print(x_data)
+architectures = [("ResNet", True, False, False), ("Attention", False, True, False), ("SIREN", False, False, True)]
 
-architectures = [("ResNet", True, False),("Attention", False, True)]    
-arch_name, use_resnet, use_attention = architectures[0]
-model = HyperPINNTopology(N=N, output_dim=3*N, use_resnet=use_resnet, use_attention=use_attention)
+# Plot the data by time
+plt.figure(figsize=(12, 8))
+for i in range(N):
+    plt.subplot(3, 3, i+1)
+    plt.plot(t_eval, X[:, i], 'b-', label=f'x_{i+1}')
+    plt.plot(t_eval, X[:, i+N], 'r-', label=f'y_{i+1}')
+    plt.plot(t_eval, X[:, i+2*N], 'g-', label=f'z_{i+1}')
+    plt.xlabel('Time')
+    plt.ylabel('State')
+    plt.title(f'Node {i+1}')
+    plt.legend()
+    plt.grid(True)
+plt.tight_layout()
+plt.savefig("rossler_oscillators.png")
+arch_name, use_resnet, use_attention, use_siren = architectures[0]
+model = HyperPINNTopology(N=N, output_dim=3*N, use_resnet=use_resnet, use_attention=use_attention, use_siren=use_siren)
 model.lambda_l1_edges = 0.03      
 model.lambda_l1_triangles = 0.05   
 model.lambda_l0_edges = 0.01
@@ -129,12 +144,11 @@ def get_labels_and_scores(all_edges, true_edges, probs):
 
 def evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges, all_4edges, true_4edges, all_5edges, true_5edges):
     with torch.no_grad():
-        edge_probs, triangle_probs, quad_probs, quint_probs = model.get_sparse_weights(t_data, use_concrete=False, hard=False)
-        # Take the last time step for evaluation
-        edge_probs = edge_probs[-1].cpu().numpy()
-        triangle_probs = triangle_probs[-1].cpu().numpy()
-        quad_probs = quad_probs[-1].cpu().numpy()
-        quint_probs = quint_probs[-1].cpu().numpy()
+        edge_probs, triangle_probs, quad_probs, quint_probs = model.get_sparse_weights(use_concrete=False, hard=False)
+        edge_probs = edge_probs.cpu().numpy()
+        triangle_probs = triangle_probs.cpu().numpy()
+        quad_probs = quad_probs.cpu().numpy()
+        quint_probs = quint_probs.cpu().numpy()
     edge_scores = [abs(edge_probs[idx]) for idx, _ in enumerate(all_2edges)]
     triangle_scores = [abs(triangle_probs[idx]) for idx, _ in enumerate(all_3edges)]
     quad_scores = [abs(quad_probs[idx]) for idx, _ in enumerate(all_4edges)]
@@ -160,7 +174,7 @@ for epoch in range(epochs):
     x_pred = model.forward(t_data)
     physics_loss = model.physics_loss(t_data)    
     data_loss = torch.mean((x_pred - x_data)**2)
-    sparsity_loss, sparsity_info = model.sparsity_regularization(t_data)        
+    sparsity_loss, sparsity_info = model.sparsity_regularization()        
     if adaptive_weights and epoch > 500:
         sparsity_weight = max(0.1, 1.0 * (0.99 ** (epoch - 500)))
     else:
@@ -189,17 +203,18 @@ for epoch in range(epochs):
     total_loss.backward() 
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   
     optimizer.step()
-    scheduler.step()     
+    scheduler.step()
     losses.append(total_loss.item())
     sparsity_stats.append(sparsity_info)
         
     if epoch % 500 == 0:
-         print(f"Epoch {epoch}, Loss: {total_loss.item():.6f}")
+         print(f"Epoch {epoch}, Total Loss: {total_loss.item():.6f}")
          print(f"  Physics: {physics_loss.item():.6f}, Data: {data_loss.item():.6f}")
          print(f"  Sparsity: {sparsity_loss.item():.6f}")
-         print(f"  L1 edges: {sparsity_info['l1_edges']:.2f}, L1 triangles: {sparsity_info['l1_triangles']:.2f}")
+         print(f"  L1 edges: {sparsity_info['l1_edges']:.2f}, L1 triangles: {sparsity_info['l1_triangles']:.2f}, L1 quads: {sparsity_info['l1_quads']:.2f}, L1 quints: {sparsity_info['l1_quints']:.2f}")
          y_true_2, y_score_2, y_true_3, y_score_3, y_true_4, y_score_4, y_true_5, y_score_5 = \
-             evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges, all_4edges, true_4edges, all_5edges, true_5edges)
+             evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, \
+                                true_3edges, all_4edges, true_4edges, all_5edges, true_5edges)
          auc_2 = compute_auc(y_true_2, y_score_2)
          auc_3 = compute_auc(y_true_3, y_score_3)
          auc_4 = compute_auc(y_true_4, y_score_4)
@@ -207,7 +222,8 @@ for epoch in range(epochs):
          print(f"  AUC (2-edges): {auc_2:.4f}, AUC (3-edges): {auc_3:.4f}, AUC (4-edges): {auc_4:.4f}, AUC (5-edges): {auc_5:.4f}")
 
 y_true_2, y_score_2, y_true_3, y_score_3, y_true_4, y_score_4, y_true_5, y_score_5 = \
-    evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, true_3edges, all_4edges, true_4edges, all_5edges, true_5edges)
+    evaluate_edges_triangles(model, t_data, all_2edges, true_2edges, all_3edges, \
+                        true_3edges, all_4edges, true_4edges, all_5edges, true_5edges)
 y_true_total = np.concatenate([y_true_2, y_true_3, y_true_4, y_true_5])
 y_score_total = np.concatenate([y_score_2, y_score_3, y_score_4, y_score_5])   
 plt.figure(figsize=(8, 6))
@@ -223,4 +239,4 @@ plt.title('ROC Curves for Identified Hypergraphs',fontsize=17)
 plt.legend(fontsize=14, loc="lower right")
 plt.xticks(fontsize=12)
 plt.yticks(fontsize=12)
-plt.savefig('roc_curves.png', bbox_inches='tight')
+plt.savefig('roc_curves_5_order_high_dim_2.png', bbox_inches='tight')

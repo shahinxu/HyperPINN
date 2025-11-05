@@ -18,12 +18,30 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return x + self.net(x)
 
+class SirenLayer(nn.Module):
+    def __init__(self, in_features, out_features, omega_0=30.0, is_first=False):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.linear = nn.Linear(in_features, out_features)
+        
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / in_features, 1 / in_features)
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / in_features) / omega_0, 
+                                           np.sqrt(6 / in_features) / omega_0)
+    
+    def forward(self, x):
+        return torch.sin(self.omega_0 * self.linear(x))
+
 class HyperPINNTopology(nn.Module):
-    def __init__(self, N, output_dim, hidden_dim=64, num_layers=4, use_resnet=True, use_attention=False):
+    def __init__(self, N, output_dim, hidden_dim=64, num_layers=4, use_resnet=True, use_attention=False, use_siren=False):
         super().__init__() 
         self.N = N  # Number of nodes
         self.use_resnet = use_resnet
         self.use_attention = use_attention
+        self.use_siren = use_siren
         input_dim = 1
 
         if use_attention:
@@ -43,25 +61,26 @@ class HyperPINNTopology(nn.Module):
             for _ in range(num_layers - 2):
                 self.res_blocks.append(ResidualBlock(hidden_dim))
             self.output_layer = nn.Linear(hidden_dim, output_dim)
+        elif use_siren:
+            self.siren_layers = nn.ModuleList()
+            self.siren_layers.append(SirenLayer(input_dim, hidden_dim, is_first=True))
+            for _ in range(num_layers - 2):
+                self.siren_layers.append(SirenLayer(hidden_dim, hidden_dim))
+            self.output_layer = nn.Linear(hidden_dim, output_dim)
         else:
-            raise ValueError("Specify either use_resnet=True or use_attention=True")
+            raise ValueError("Specify one of: use_resnet=True, use_attention=True, or use_siren=True")
         
-        # For pairwise up to fifth-order interactions
         num_edges = N * (N-1)//2
         num_triangles = N * (N-1) * (N-2) // 6
-        # add 4-node and 5-node hyperedges (quadruples and quintuples)
         num_quads = N * (N-1) * (N-2) * (N-3) // 24
         num_quints = N * (N-1) * (N-2) * (N-3) * (N-4) // 120
-
-        # Dynamic hypergraph network: input t, output edge/triangle/quad/quint weights
-        self.dynamic_hypergraph = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, num_edges + num_triangles + num_quads + num_quints)
-        )
-
+        
+        # Static graph parameters (replace dynamic hypergraph)
+        self.edge_weights = nn.Parameter(torch.randn(num_edges) * 0.1 - 2.0)  
+        self.triangle_weights = nn.Parameter(torch.randn(num_triangles) * 0.1 - 3.0)
+        self.quad_weights = nn.Parameter(torch.randn(num_quads) * 0.1 - 3.5)
+        self.quint_weights = nn.Parameter(torch.randn(num_quints) * 0.1 - 4.0)
+        
         self.lambda_l1_edges = 0.01      
         self.lambda_l1_triangles = 0.01 
         self.lambda_l1_quads = 0.01
@@ -92,6 +111,11 @@ class HyperPINNTopology(nn.Module):
             for block in self.res_blocks:
                 h = block(h)
             return self.output_layer(h)
+        elif self.use_siren:
+            h = t
+            for layer in self.siren_layers:
+                h = layer(h)
+            return self.output_layer(h)
   
     def concrete_binary_gates(self, logits, temperature=1.0, hard=False):
         uniform = torch.rand_like(logits)
@@ -106,28 +130,17 @@ class HyperPINNTopology(nn.Module):
             y = y_soft     
         return y
     
-    def get_sparse_weights(self, t, use_concrete=True, hard=False):
-        raw_weights = self.dynamic_hypergraph(t)
-        num_edges = len(self.edge_indices)
-        num_triangles = len(self.triangle_indices)
-        num_quads = len(self.quad_indices)
-        num_quints = len(self.quint_indices)
-
-        edge_logits = raw_weights[:, :num_edges]
-        triangle_logits = raw_weights[:, num_edges:num_edges+num_triangles]
-        quad_logits = raw_weights[:, num_edges+num_triangles:num_edges+num_triangles+num_quads]
-        quint_logits = raw_weights[:, num_edges+num_triangles+num_quads:]
-
+    def get_sparse_weights(self, use_concrete=True, hard=False):
         if use_concrete:
-            edge_probs = self.concrete_binary_gates(edge_logits, self.temperature, hard)
-            triangle_probs = self.concrete_binary_gates(triangle_logits, self.temperature, hard)
-            quad_probs = self.concrete_binary_gates(quad_logits, self.temperature, hard)
-            quint_probs = self.concrete_binary_gates(quint_logits, self.temperature, hard)
+            edge_probs = self.concrete_binary_gates(self.edge_weights, self.temperature, hard)
+            triangle_probs = self.concrete_binary_gates(self.triangle_weights, self.temperature, hard)
+            quad_probs = self.concrete_binary_gates(self.quad_weights, self.temperature, hard)
+            quint_probs = self.concrete_binary_gates(self.quint_weights, self.temperature, hard)
         else:
-            edge_probs = torch.sigmoid(edge_logits)
-            triangle_probs = torch.sigmoid(triangle_logits)
-            quad_probs = torch.sigmoid(quad_logits)
-            quint_probs = torch.sigmoid(quint_logits)
+            edge_probs = torch.sigmoid(self.edge_weights)
+            triangle_probs = torch.sigmoid(self.triangle_weights)
+            quad_probs = torch.sigmoid(self.quad_weights)
+            quint_probs = torch.sigmoid(self.quint_weights)
             if hard:
                 edge_probs = (edge_probs > 0.5).float()
                 triangle_probs = (triangle_probs > 0.5).float()
@@ -136,22 +149,11 @@ class HyperPINNTopology(nn.Module):
 
         return edge_probs, triangle_probs, quad_probs, quint_probs
     
-    def sparsity_regularization(self, t):
-        raw_weights = self.dynamic_hypergraph(t)
-        num_edges = len(self.edge_indices)
-        num_triangles = len(self.triangle_indices)
-        num_quads = len(self.quad_indices)
-        num_quints = len(self.quint_indices)
-
-        edge_logits = raw_weights[:, :num_edges]
-        triangle_logits = raw_weights[:, num_edges:num_edges+num_triangles]
-        quad_logits = raw_weights[:, num_edges+num_triangles:num_edges+num_triangles+num_quads]
-        quint_logits = raw_weights[:, num_edges+num_triangles+num_quads:]
-
-        edge_probs = torch.sigmoid(edge_logits)
-        triangle_probs = torch.sigmoid(triangle_logits)
-        quad_probs = torch.sigmoid(quad_logits)
-        quint_probs = torch.sigmoid(quint_logits)
+    def sparsity_regularization(self):
+        edge_probs = torch.sigmoid(self.edge_weights)
+        triangle_probs = torch.sigmoid(self.triangle_weights)
+        quad_probs = torch.sigmoid(self.quad_weights)
+        quint_probs = torch.sigmoid(self.quint_weights)
 
         l1_edges = torch.sum(edge_probs)
         l1_triangles = torch.sum(triangle_probs)
@@ -192,28 +194,18 @@ class HyperPINNTopology(nn.Module):
         coup_rete = torch.zeros_like(xold)
         coup_triangular = torch.zeros_like(xold)
 
-        raw_weights = self.dynamic_hypergraph(t)
-        num_edges = len(self.edge_indices)
-        num_triangles = len(self.triangle_indices)
-        num_quads = len(self.quad_indices)
-        num_quints = len(self.quint_indices)
-
-        edge_weights = raw_weights[:, :num_edges]
-        triangle_weights = raw_weights[:, num_edges:num_edges+num_triangles]
-        quad_weights = raw_weights[:, num_edges+num_triangles:num_edges+num_triangles+num_quads]
-        quint_weights = raw_weights[:, num_edges+num_triangles+num_quads:]
-
-        adj_matrix = torch.sigmoid(edge_weights)
-        triangle_weights_sigmoid = torch.sigmoid(triangle_weights)
-        quad_weights_sigmoid = torch.sigmoid(quad_weights)
-        quint_weights_sigmoid = torch.sigmoid(quint_weights)
+        # Static weights (no dependence on t)
+        adj_matrix = torch.sigmoid(self.edge_weights)
+        triangle_weights_sigmoid = torch.sigmoid(self.triangle_weights)
+        quad_weights_sigmoid = torch.sigmoid(self.quad_weights)
+        quint_weights_sigmoid = torch.sigmoid(self.quint_weights)
         
         for idx, (i, j) in enumerate(self.edge_indices):
-            weight = adj_matrix[:, idx]
+            weight = adj_matrix[idx]
             coup_rete[:, i] += weight * (xold[:, j] - xold[:, i])
             coup_rete[:, j] += weight * (xold[:, i] - xold[:, j])
         for idx, (i, j, k) in enumerate(self.triangle_indices):
-            weight = triangle_weights_sigmoid[:, idx]
+            weight = triangle_weights_sigmoid[idx]
             term_i = weight * (xold[:, j]**2 * xold[:, k] - xold[:, i]**3 + 
                              xold[:, j] * xold[:, k]**2 - xold[:, i]**3)
             term_j = weight * (xold[:, i]**2 * xold[:, k] - xold[:, j]**3 + 
@@ -226,7 +218,7 @@ class HyperPINNTopology(nn.Module):
         # 4-node interactions (quads)
         coup_quads = torch.zeros_like(xold)
         for idx, (i, j, k, l) in enumerate(self.quad_indices):
-            weight = quad_weights_sigmoid[:, idx]
+            weight = quad_weights_sigmoid[idx]
             term_i = weight * (xold[:, j]**2 * xold[:, k] * xold[:, l] - xold[:, i]**4)
             term_j = weight * (xold[:, i]**2 * xold[:, k] * xold[:, l] - xold[:, j]**4)
             term_k = weight * (xold[:, i]**2 * xold[:, j] * xold[:, l] - xold[:, k]**4)
@@ -238,7 +230,7 @@ class HyperPINNTopology(nn.Module):
         # 5-node interactions (quints)
         coup_quints = torch.zeros_like(xold)
         for idx, (i, j, k, l, m) in enumerate(self.quint_indices):
-            weight = quint_weights_sigmoid[:, idx]
+            weight = quint_weights_sigmoid[idx]
             term_i = weight * (xold[:, j]**2 * xold[:, k] * xold[:, l] * xold[:, m] - xold[:, i]**5)
             term_j = weight * (xold[:, i]**2 * xold[:, k] * xold[:, l] * xold[:, m] - xold[:, j]**5)
             term_k = weight * (xold[:, i]**2 * xold[:, j] * xold[:, l] * xold[:, m] - xold[:, k]**5)
