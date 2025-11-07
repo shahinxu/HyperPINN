@@ -184,66 +184,105 @@ class HyperPINNTopology(nn.Module):
         dx_dt_pred = torch.zeros_like(x_pred)
         for i in range(x_pred.shape[1]):
             dx_dt_pred[:, i] = torch.autograd.grad(x_pred[:, i].sum(), t, create_graph=True, retain_graph=True)[0].squeeze()
-            
-        N = self.N
-        xold = x_pred[:,0:N]
-        yold = x_pred[:,N:2*N]
-        zold = x_pred[:,2*N:3*N]
-        ar, br, cr = 0.2, 0.2, 5.7
-        k,kD = 0.4,0.3
-        coup_rete = torch.zeros_like(xold)
-        coup_triangular = torch.zeros_like(xold)
 
-        # Static weights (no dependence on t)
-        adj_matrix = torch.sigmoid(self.edge_weights)
-        triangle_weights_sigmoid = torch.sigmoid(self.triangle_weights)
-        quad_weights_sigmoid = torch.sigmoid(self.quad_weights)
-        quint_weights_sigmoid = torch.sigmoid(self.quint_weights)
-        
+        N = self.N
+        # Expecting output format: [v (N), pos_x (N), pos_y (N), steering (N)]
+        v = x_pred[:, 0:N]
+        pos_x = x_pred[:, N:2*N]
+        pos_y = x_pred[:, 2*N:3*N]
+        steering = x_pred[:, 3*N:4*N]
+
+        # Physical / model parameters (match Driving.py defaults)
+        v_desired = 30.0
+        tau_accel = 2.0
+        tau_steer = 1.5
+        k_follow = 0.3
+        k_lane = 0.2
+        k_intersection = 0.4
+        k_roundabout = 0.5
+        k_complex = 0.6
+
+        # Initialize coupling terms
+        coupling_follow = torch.zeros_like(v)
+        coupling_lane = torch.zeros_like(v)
+        coupling_intersection = torch.zeros_like(v)
+        coupling_roundabout = torch.zeros_like(v)
+        coupling_complex = torch.zeros_like(v)
+
+        # Static learned weights
+        edge_probs = torch.sigmoid(self.edge_weights)
+        triangle_probs = torch.sigmoid(self.triangle_weights)
+        quad_probs = torch.sigmoid(self.quad_weights)
+        quint_probs = torch.sigmoid(self.quint_weights)
+
+        # Pairwise contributions
         for idx, (i, j) in enumerate(self.edge_indices):
-            weight = adj_matrix[idx]
-            coup_rete[:, i] += weight * (xold[:, j] - xold[:, i])
-            coup_rete[:, j] += weight * (xold[:, i] - xold[:, j])
+            w = edge_probs[idx]
+
+            # follow model: front car affects rear car asymmetrically (match Driving.py)
+            diff = v[:, i] - v[:, j]
+            mask = (diff > 0).float()  # 1 if i is faster than j
+            # when i is front (diff>0): j gets +0.5*diff, i gets -0.1*diff
+            # else (j front): i gets +0.5*( -diff ), j gets -0.1*( -diff )
+            coupling_follow[:, j] += w * (mask * (0.5 * diff) + (1.0 - mask) * (0.1 * diff))
+            coupling_follow[:, i] += w * (mask * (-0.1 * diff) + (1.0 - mask) * (-0.5 * diff))
+
+            # lane-change influence via partner steering (same coefficient)
+            coupling_lane[:, i] += w * torch.sin(steering[:, j]) * 0.3
+            coupling_lane[:, j] += w * torch.sin(steering[:, i]) * 0.3
+
+        # Triangle interactions (intersection-like)
         for idx, (i, j, k) in enumerate(self.triangle_indices):
-            weight = triangle_weights_sigmoid[idx]
-            term_i = weight * (xold[:, j]**2 * xold[:, k] - xold[:, i]**3 + 
-                             xold[:, j] * xold[:, k]**2 - xold[:, i]**3)
-            term_j = weight * (xold[:, i]**2 * xold[:, k] - xold[:, j]**3 + 
-                             xold[:, i] * xold[:, k]**2 - xold[:, j]**3)
-            term_k = weight * (xold[:, i]**2 * xold[:, j] - xold[:, k]**3 + 
-                             xold[:, i] * xold[:, j]**2 - xold[:, k]**3)   
-            coup_triangular[:, i] += term_i
-            coup_triangular[:, j] += term_j
-            coup_triangular[:, k] += term_k
-        # 4-node interactions (quads)
-        coup_quads = torch.zeros_like(xold)
+            w = triangle_probs[idx]
+            # priority: highest speed gets priority (non-differentiable like Driving.py)
+            speeds = torch.stack([v[:, i], v[:, j], v[:, k]], dim=1)  # (B,3)
+            max_idx = torch.argmax(speeds, dim=1)  # per-batch index 0/1/2
+            nodes = [i, j, k]
+            # apply same per-sample rules as Driving.py
+            B = v.shape[0]
+            for b in range(B):
+                mi = int(max_idx[b].item())
+                priority_car = nodes[mi]
+                for node in nodes:
+                    if node != priority_car:
+                        coupling_intersection[b, node] += -0.4 * (v[b, priority_car] - v[b, node]) * w
+                    else:
+                        others = [n for n in nodes if n != node]
+                        coupling_intersection[b, node] += 0.2 * w * torch.mean(torch.stack([v[b, n] for n in others]))
+
+        # Quad interactions (roundabout-like)
         for idx, (i, j, k, l) in enumerate(self.quad_indices):
-            weight = quad_weights_sigmoid[idx]
-            term_i = weight * (xold[:, j]**2 * xold[:, k] * xold[:, l] - xold[:, i]**4)
-            term_j = weight * (xold[:, i]**2 * xold[:, k] * xold[:, l] - xold[:, j]**4)
-            term_k = weight * (xold[:, i]**2 * xold[:, j] * xold[:, l] - xold[:, k]**4)
-            term_l = weight * (xold[:, i]**2 * xold[:, j] * xold[:, k] - xold[:, l]**4)
-            coup_quads[:, i] += term_i
-            coup_quads[:, j] += term_j
-            coup_quads[:, k] += term_k
-            coup_quads[:, l] += term_l
-        # 5-node interactions (quints)
-        coup_quints = torch.zeros_like(xold)
+            w = quad_probs[idx]
+            nodes = [i, j, k, l]
+            for node in nodes:
+                others = [n for n in nodes if n != node]
+                right_priority = sum([1 for n in others if n < node])
+                coupling_roundabout[:, node] += w * (0.3 * right_priority - 0.2 * len(others))
+                coupling_roundabout[:, node] += w * 0.1 * torch.sin(steering[:, node] + 3.14159/4)
+
+        # Quint interactions (complex hubs)
         for idx, (i, j, k, l, m) in enumerate(self.quint_indices):
-            weight = quint_weights_sigmoid[idx]
-            term_i = weight * (xold[:, j]**2 * xold[:, k] * xold[:, l] * xold[:, m] - xold[:, i]**5)
-            term_j = weight * (xold[:, i]**2 * xold[:, k] * xold[:, l] * xold[:, m] - xold[:, j]**5)
-            term_k = weight * (xold[:, i]**2 * xold[:, j] * xold[:, l] * xold[:, m] - xold[:, k]**5)
-            term_l = weight * (xold[:, i]**2 * xold[:, j] * xold[:, k] * xold[:, m] - xold[:, l]**5)
-            term_m = weight * (xold[:, i]**2 * xold[:, j] * xold[:, k] * xold[:, l] - xold[:, m]**5)
-            coup_quints[:, i] += term_i
-            coup_quints[:, j] += term_j
-            coup_quints[:, k] += term_k
-            coup_quints[:, l] += term_l
-            coup_quints[:, m] += term_m
-        
-        term1 = -yold - zold + k * coup_rete + kD * coup_triangular + kD * coup_quads + kD * coup_quints
-        term2 = xold + ar * yold
-        term3 = br + zold * (xold - cr)
-        term  = torch.cat([term1, term2, term3],dim=1)  
-        return torch.mean((dx_dt_pred - term) ** 2) 
+            w = quint_probs[idx]
+            nodes = [i, j, k, l, m]
+            for node in nodes:
+                others = [n for n in nodes if n != node]
+                avg_speed = torch.mean(torch.stack([v[:, n] for n in others], dim=1), dim=1)
+                avg_steer = torch.mean(torch.stack([steering[:, n] for n in others], dim=1), dim=1)
+                coupling_complex[:, node] += w * 0.2 * (avg_speed - v[:, node])
+                coupling_complex[:, node] += w * 0.1 * torch.sin(avg_steer - steering[:, node])
+
+        # Expected derivatives following Driving.py formulas
+        dvdt_expected = (1.0 / tau_accel) * (v_desired - v + 
+                                             k_follow * coupling_follow +
+                                             k_lane * coupling_lane +
+                                             k_intersection * coupling_intersection +
+                                             k_roundabout * coupling_roundabout)
+
+        dxdt_expected = v * torch.cos(steering)
+        dydt_expected = v * torch.sin(steering)
+        dsdt_expected = -steering / tau_steer + 0.1 * (v - v_desired) + k_complex * coupling_complex
+
+        expected = torch.cat([dvdt_expected, dxdt_expected, dydt_expected, dsdt_expected], dim=1)
+
+        loss = torch.mean((dx_dt_pred - expected) ** 2)
+        return loss
